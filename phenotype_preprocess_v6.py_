@@ -1,0 +1,232 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import sys
+import os
+import pingouin as pg
+import scipy.stats as stats
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+from sklearn.decomposition import PCA
+from sklearn.impute import SimpleImputer
+from sklearn.cluster import KMeans
+from matplotlib.lines import Line2D
+import math
+from statsmodels.stats.anova import anova_lm
+import seaborn as sns
+# To run the matplotlib in command line in Unix, the backend should be configured by the code MPLBACKEND=qt5agg 
+# at the beginning of the command
+# command line format: MPLBACKEND=qt5agg python directory of the script
+
+if '-help' in sys.argv:
+	print('arg1: path of the raw phenotypic data set\n')
+	
+	print('arg2: path of output folder\n')
+	print('arg3: path of output file date\n')
+else:
+	# 1. Raw data import
+	#import data of all the fish for parameters averaged across the four trials using argument1
+	#arugment1 is the path of the raw phenotypic data set
+	#e.g. '/Users/jialexu/Library/CloudStorage/Box-Box/UCSF/Research/Project2GWAS-BehvaioralGenetics/experiments/Behavior_test/DerivedData/AccumulativeResults-20201222.xlsx' 
+	df_pheno=pd.read_excel(sys.argv[1], sheet_name=0, index_col=0, engine='openpyxl')
+
+	#import data of all the fish for parameters of each trial
+
+	df_pheno_trial1 = pd.read_excel(sys.argv[1], sheet_name='Trial1', index_col=0, engine='openpyxl')
+
+	df_pheno_trial2 = pd.read_excel(sys.argv[1], sheet_name='Trial2', index_col=0, engine='openpyxl')
+
+	df_pheno_trial3 = pd.read_excel(sys.argv[1], sheet_name='Trial3', index_col=0, engine='openpyxl')
+
+	df_pheno_trial4 = pd.read_excel(sys.argv[1], sheet_name='Trial4', index_col=0, engine='openpyxl')
+	#import dark zone travel distance in each trial
+	df_zone_pheno = pd.read_excel(sys.argv[1],sheet_name=3, index_col=0, engine='openpyxl')
+	df_zone_pheno = df_zone_pheno.loc[:,df_zone_pheno.columns.str.endswith('D_zone_distance')]
+	df_zone_pheno.columns = ['T1_DZTD','T2_DZTD','T3_DZTD','T4_DZTD']
+	df_zone_pheno = df_zone_pheno.fillna(0)        
+
+	#find the overlapping index among all the datasets
+	#the final index stands for a list of fish that have been succesfully phenotyped in all four trials and also genotyped
+	index = df_pheno.index.intersection(df_pheno_trial1.index).intersection(df_pheno_trial2.index).intersection(df_pheno_trial3.index).intersection(df_pheno_trial4.index).intersection(df_zone_pheno.index)
+	#use the ovearlapping index to slice the dataset of the mean parameter and the dataset of each trial
+	df_pheno_sub = df_pheno.loc[index]
+	df_pheno_sub_trial1 = df_pheno_trial1.loc[index]
+	df_pheno_sub_trial1.columns = 'T1_'+df_pheno_sub_trial1.columns
+	df_pheno_sub_trial2 = df_pheno_trial2.loc[index]
+	df_pheno_sub_trial2.columns = 'T2_'+df_pheno_sub_trial2.columns
+	df_pheno_sub_trial3 = df_pheno_trial3.loc[index]
+	df_pheno_sub_trial3.columns = 'T3_'+df_pheno_sub_trial3.columns
+	df_pheno_sub_trial4 = df_pheno_trial4.loc[index]
+	df_pheno_sub_trial4.columns = 'T4_'+df_pheno_sub_trial4.columns
+        
+	df_pheno_sub_zone = df_zone_pheno.loc[index]
+	#add LDCI of each trial to the dataset of mean parameters
+	df_pheno_sub = pd.concat((df_pheno_sub,
+	                          df_pheno_sub_trial1.iloc[:, 1:],
+	                          df_pheno_sub_trial2.iloc[:, 1:],
+	                          df_pheno_sub_trial3.iloc[:, 1:],
+	                          df_pheno_sub_trial4.iloc[:, 1:], df_pheno_sub_zone),axis=1)
+
+	#add three covariables to each individual
+	def arena_number(df):
+	    col=int(df[:-1])
+	    row=df[-1]
+	    rows=['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
+	    arena = (1-col%2)*8+rows.index(row)+1
+	    return arena
+
+	df_pheno_sub['week'] = df_pheno_sub.index.str[:8]
+
+	df_pheno_sub['plate'] = df_pheno_sub.index.str.split('_').str[1]
+
+	df_pheno_sub['well'] = df_pheno_sub.index.str.split('_').str[2]
+
+	rows=['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
+
+	df_pheno_sub['arena'] = df_pheno_sub['well'].apply(lambda df: arena_number(df))
+
+	def group_number(x):
+	    return x//2+x%2
+	df_pheno_sub['group'] = (df_pheno_sub['plate'].str[-1].astype(int)-1)*6+df_pheno_sub['well'].str[:-1].astype(int).\
+	                apply(lambda x: group_number(x))
+
+	df_pheno_sub['group']=df_pheno_sub['group'].astype(object, copy=True)
+
+	df_pheno_sub['arena']=df_pheno_sub['arena'].astype(object, copy=True)
+
+	df_pheno_sub=df_pheno_sub.dropna()
+
+	# 2. Data cleaning
+	## Define a class named as processed phenotype or ProPheno to contain all the 
+	## information of a processed phenotype
+	class ProPheno():
+	    
+	    
+	    
+	    #assign attributes to the class
+	    def __init__(self, pheno, covar ,rawdata):
+	        self.pheno=pheno #a string for the name of the phenotype
+	        self.covar=covar #list of covariables 
+	        self.rawdata=rawdata #raw phenotype data
+	    #define a method to perform multiple linear regression with the covariables
+	    def multiple_linear_regression(self):
+	        formula = self.pheno+'~'+'+'.join(self.covar)
+	        data = pd.concat((self.rawdata[self.pheno], self.rawdata[self.covar]), axis=1)
+	        model = smf.ols(formula, data=data).fit()
+	        anova_table=anova_lm(model)
+	        return model 
+	    
+	    #define a method to export anova analysis of the covariables
+	    def anova(self):
+	        return anova_lm(self.multiple_linear_regression())
+	    
+	    #define a method to export model summary 
+	    def model_summary(self):
+	        return self.multiple_linear_regression().summary()
+	    
+	    #define a method to export a processed dataset including
+	    #raw, fitted, residual and normalized value of the phenotype
+	    def processed(self):
+	        raw = self.rawdata[self.pheno]
+	        fitted_value = self.multiple_linear_regression().predict()
+	        residual = self.multiple_linear_regression().resid
+	        qnorm = (residual.rank(pct=True)*0.99).apply(lambda x: stats.norm.ppf(x))
+	        return pd.DataFrame({'qnorm':qnorm, 'residual':residual, 'fitted':fitted_value, 'raw':raw})
+	    
+	    #define a method to find the outliers
+	    def outliers(self):
+	        x = self.processed()['qnorm']
+	        Q1 = x.quantile(0.25)
+	        Q3 = x.quantile(0.75)
+	        IQR = Q3 - Q1
+	        limit1 = Q1 - 1.5*IQR
+	        limit2 = Q3 + 1.5*IQR
+	        return x[(x<limit1)|(x>limit2)]
+	    
+	    #define a method to exclude the outliers
+	    def outlier_remove(self):
+	        outliers = self.outliers().index
+	        df = self.processed().drop(index=outliers)
+	        return df
+	    
+	    #define a method to get the final dataset for GWAS
+	    def GWAS_data(self):
+	        df = self.outlier_remove()
+	        df.insert(0, 'family', 0)
+	        df = df.reset_index().set_index('family')
+	        return df.iloc[:, :2]
+
+	#3. export each phenotype separately for GWAS in wynton
+	#using argument3 as the folder pathway for the output file 
+	#e.g. '/Users/jialexu/Library/CloudStorage/Box-Box/UCSF/Research/Project2GWAS-BehvaioralGenetics/experiments/Gwas/data/phenotype/20220105/'
+	if '--adjust-peaksnp' in sys.argv:
+		pos = sys.argv.index('--adjust-peaksnp')#this flag indicates adjustment for peak snp. two following arguments are result folder for snp dependency test and the trait name
+		#read the vcf files of all the peak snps and combine the genotypes of these snps  together for adjustment
+		dfs=[]
+		for file in os.listdir(sys.argv[pos+1]):
+			if file.endswith('vcf_'+sys.argv[pos+2]+'.recode.vcf'):
+				print('%s'%file)
+				df_gwassnp_vcf=pd.read_csv(sys.argv[pos+1]+file, sep='\t', skiprows=12)
+				dfs.append(df_gwassnp_vcf)
+		print(len(dfs))                                
+		df_gwassnp_vcf = pd.concat(dfs, sort=False)
+		df_peak_snp_geno = df_gwassnp_vcf.iloc[:, 9:].apply(lambda x: x.str[0].astype('int')+x.str[2].astype('int')).transpose()
+		df_peak_snp_geno = df_peak_snp_geno.loc[df_peak_snp_geno.index.intersection(df_pheno_sub.index)]
+		df_peak_snp_geno.columns = df_gwassnp_vcf['#CHROM']+'_'+df_gwassnp_vcf['POS'].astype('str')
+		print(df_peak_snp_geno.head(5))
+		df_pheno_snpex=pd.concat((df_pheno_sub,df_peak_snp_geno),axis=1, sort=False).dropna()
+		df_pheno_snpex=df_pheno_snpex.rename_axis('Fish_ID')#this is the final dataset with peak snp genotype included 
+
+		#adjust the phenotype by including the peak snp genotypes as covariants 
+		#set up the output file pathway
+		peaksnp_adjusted_pheno_list = []
+		filename = 'peaksnp_adjusted_pheno.txt'
+		full_filename = sys.argv[pos+1]+filename
+		
+		for pheno in df_pheno_sub.columns[:-5]:
+			processed_pheno_sub = ProPheno(pheno = pheno, covar=['week', 'group', 'arena']+list(df_peak_snp_geno.columns), rawdata=df_pheno_snpex).GWAS_data()
+			peaksnp_adjusted_pheno_list.append(processed_pheno_sub.set_index('Fish_ID'))
+		print('phenotype adjusted for peak snps \n')
+		print(list(df_peak_snp_geno.columns))
+		df_peaksnp_adjusted_pheno = pd.concat(peaksnp_adjusted_pheno_list, axis=1, sort=False)
+		df_peaksnp_adjusted_pheno.columns = df_pheno_sub.columns[:-5]
+		df_peaksnp_adjusted_pheno_output = df_peaksnp_adjusted_pheno.rename_axis('Fish_ID')
+		df_peaksnp_adjusted_pheno_output = df_peaksnp_adjusted_pheno_output.reset_index()
+		df_peaksnp_adjusted_pheno_output.insert(0, 'famliy', 0)
+		df_peaksnp_adjusted_pheno_output = df_peaksnp_adjusted_pheno_output.fillna('NA')
+		df_peaksnp_adjusted_pheno_output.to_csv(full_filename, sep =' ', header=False, index=False)
+			
+	else:
+		datalist = []
+
+		path = sys.argv[2]
+
+		for pheno in df_pheno_sub.columns[:-5]:
+			processed_pheno_sub = ProPheno(pheno = pheno, covar=['week', 'group', 'arena'], rawdata=df_pheno_sub).GWAS_data()
+	    
+			datalist.append(processed_pheno_sub.set_index('Fish_ID'))
+	    
+	                #using argument4 to specify the date of the result file
+	                #e.g. '_pro_20220105.txt'
+			filename = 'pheno_'+pheno+sys.argv[3]
+	    
+			full_filename = path+filename
+	    
+			processed_pheno_sub.to_csv(full_filename, sep =' ', header=False)
+	    
+			print(full_filename)
+
+		#combine processed dataset of all phenotype into one dataset
+		df_propheno_sub = pd.concat(datalist, axis=1, sort=False)
+
+		df_propheno_sub.columns = df_pheno_sub.columns[:-5]
+
+		df_metapheno_sub_pro = df_propheno_sub.copy()
+
+		df_metapheno_sub_pro.insert(0, 'family', 0)
+
+		df_metapheno_sub_pro=df_metapheno_sub_pro.reset_index().rename(columns={'index':'Fish_ID'}).set_index('family')
+
+		df_metapheno_sub_pro=df_metapheno_sub_pro.fillna('NA')
+		df_metapheno_sub_pro.to_csv(path+'metapheno'+sys.argv[3], sep =' ', header=False)
+		df_metapheno_sub_pro.iloc[:0, 1:].to_csv(path+'traits.txt', sep = ' ', header=True)
